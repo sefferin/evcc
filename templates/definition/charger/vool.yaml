@@ -1,0 +1,38 @@
+template: vool
+products:
+  - brand: VOOL
+    description:
+      generic: Charger
+  - brand: Partino
+    description:
+      generic: x VOOL
+capabilities: ["mA", "rfid", "1p3p", "meter"]
+requirements:
+  description:
+    de: |
+      Die Modbus TCP/UDP-Schnittstelle muss aktiviert werden (Ladegerät-Parameter 522 "Enable Modbus TCP/UDP interface"), sie ist standardmässig deaktiviert. Modbus ist entweder über Ethernet oder WLAN verfügbar, nicht über beide gleichzeitig, und dieselbe Schnittstelle wird auch für OCPP genutzt. Gemischte Konfigurationen (z.B. Modbus über WLAN, OCPP über Ethernet) werden nicht unterstützt. Es sind maximal 3 gleichzeitige Verbindungen möglich.
+
+      Bei mehreren Ladestationen kann jeder Station eine eigene Netzphase für das einphasige Laden zugewiesen werden, um die Last gleichmässig auf L1, L2 und L3 zu verteilen.
+    en: |
+      The Modbus TCP/UDP interface must be enabled (charger parameter 522 "Enable Modbus TCP/UDP interface"), it is disabled by default. Modbus is available on either Ethernet or Wi-Fi, but not both simultaneously, and the same interface is also used for OCPP. Hybrid configurations (e.g. Modbus on Wi-Fi while OCPP runs on Ethernet) are not supported. A maximum of 3 simultaneous connections is possible.
+
+      With multiple charging stations, each station can be assigned its own grid phase for single-phase charging to distribute the load evenly across L1, L2 and L3.
+caveats:
+  - description:
+      de: Die Phasenumschaltung ist auf 10 Schaltvorgänge pro Stunde begrenzt.
+      en: Phase switching is limited to 10 switching operations per hour.
+params:
+  - name: modbus
+    choice: ["tcpip"]
+    id: 255
+  - name: phase
+    type: choice
+    choice: ["L1", "L2", "L3"]
+    default: "L1"
+    description:
+      de: Netzphase für einphasiges Laden
+      en: Grid phase used for single-phase charging
+render: |
+  type: vool
+  {{- include "modbus" . }}
+  phase: {{ .phase }}
