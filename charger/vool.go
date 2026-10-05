@@ -1,6 +1,7 @@
 package charger
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -16,10 +17,10 @@ import (
 // Vool charger implementation
 type Vool struct {
 	implement.Caps
-	log     *util.Logger
-	conn    *modbus.Connection
-	enabled bool
-	phase   uint16 // Netzphase für einphasiges Laden: 1..3
+	log   *util.Logger
+	conn  *modbus.Connection
+	phase uint16 // Netzphase für einphasiges Laden: 1..3
+	id    string // per Karte autorisierte ID der laufenden Session
 }
 
 // VOOL Modbus registers (all holding registers, big-endian)
@@ -33,12 +34,15 @@ const (
 	voolRegCommand      = 500
 	voolRegCurrentLimit = 501
 	voolRegPhases       = 502
-	voolRegAuthorizeID  = 1100 // 1100..1117, 18 Register
+	voolRegAuthorizeID  = 1100 // 1100..1118, 19 Register (nur komplett lesbar)
 )
 
 const (
 	voolCmdStart = 1
 	voolCmdStop  = 2
+
+	voolMinCurrent = 6  // A, darunter geht die Box in SUSPENDED_EVSE
+	voolMaxCurrent = 32 // A, Maximum der Station (die Box lehnt höhere Werte ab)
 )
 
 func init() {
@@ -92,11 +96,10 @@ func NewVool(ctx context.Context, settings modbus.TcpSettings, phase int) (api.C
 	conn.Logger(log.TRACE)
 
 	wb := &Vool{
-		Caps:    implement.New(),
-		log:     log,
-		conn:    conn,
-		enabled: true,
-		phase:   uint16(phase),
+		Caps:  implement.New(),
+		log:   log,
+		conn:  conn,
+		phase: uint16(phase),
 	}
 
 	// Phasenumschaltung nur anbieten, wenn alle drei Netzphasen anliegen
@@ -146,6 +149,17 @@ func (wb *Vool) Status() (api.ChargeStatus, error) {
 	case 2, 4, 5, 6: // PREPARING, SUSPENDED_EV, SUSPENDED_EVSE, FINISHING
 		return api.StatusB, nil
 	case 3, 10: // CHARGING, STARTING_CHARGING
+		// 3 liegt schon bei B an (freigegeben, Schütz offen):
+		// C nur melden, wenn tatsächlich Strom fliesst
+		l1, l2, l3, err := wb.Currents()
+		if err != nil {
+			return api.StatusNone, err
+		}
+
+		// unter 0.5 A zieht das Fahrzeug nichts (Anlaufphase, Messrauschen)
+		if l1+l2+l3 < 0.5 {
+			return api.StatusB, nil
+		}
 		return api.StatusC, nil
 	case 8, 9: // UNAVAILABLE, FAULTED
 		return api.StatusNone, fmt.Errorf("charger not available: state %d", s)
@@ -156,17 +170,14 @@ func (wb *Vool) Status() (api.ChargeStatus, error) {
 
 // Enabled implements the api.Charger interface
 func (wb *Vool) Enabled() (bool, error) {
-	state, err := wb.readUint16(voolRegChargerState)
+	s, err := wb.readUint16(voolRegChargerState)
 	if err != nil {
 		return false, err
 	}
 
-	// Box hat selbst gestoppt: Ladung ist nicht freigegeben
-	if state == 5 { // SUSPENDED_EVSE
-		return false, nil
-	}
-
-	return wb.enabled, nil
+	// Freigabe kommt aus dem Zustand der Box:
+	// 3 CHARGING, 4 SUSPENDED_EV, 10 STARTING_CHARGING
+	return s == 3 || s == 4 || s == 10, nil
 }
 
 // Enable implements the api.Charger interface
@@ -176,12 +187,7 @@ func (wb *Vool) Enable(enable bool) error {
 		cmd = voolCmdStart
 	}
 
-	if err := wb.writeUint16(voolRegCommand, cmd); err != nil {
-		return err
-	}
-
-	wb.enabled = enable
-	return nil
+	return wb.writeUint16(voolRegCommand, cmd)
 }
 
 // MaxCurrent implements the api.Charger interface
@@ -193,9 +199,13 @@ var _ api.ChargerEx = (*Vool)(nil)
 
 // MaxCurrentMillis implements the api.ChargerEx interface
 func (wb *Vool) MaxCurrentMillis(current float64) error {
-	if current < 6 {
+	// Unter 6 A nimmt die Box den Wert zwar an, geht dann aber in SUSPENDED_EVSE (5)
+	if current < voolMinCurrent {
 		return fmt.Errorf("invalid current %.1f", current)
 	}
+
+	// Maximum der Station, darüber lehnt die Box den Wert ab
+	current = min(current, voolMaxCurrent)
 
 	// Einheit 0.01 A: 16 A -> 1600
 	return wb.writeUint16(voolRegCurrentLimit, uint16(current*100))
@@ -211,6 +221,13 @@ func (wb *Vool) GetMaxCurrent() (float64, error) {
 	}
 
 	return float64(u) / 100, nil
+}
+
+var _ api.CurrentLimiter = (*Vool)(nil)
+
+// GetMinMaxCurrent implements the api.CurrentLimiter interface
+func (wb *Vool) GetMinMaxCurrent() (float64, float64, error) {
+	return voolMinCurrent, voolMaxCurrent, nil
 }
 
 var _ api.Meter = (*Vool)(nil)
@@ -289,22 +306,56 @@ func (wb *Vool) getPhases() (int, error) {
 	return bits.OnesCount16(u & 0b111), nil
 }
 
+// readAuthorizeID reads the RFID token. Only the complete field 1100..1118
+// is readable, reading it clears the event flag in register 99.
+func (wb *Vool) readAuthorizeID() (string, error) {
+	b, err := wb.conn.ReadHoldingRegisters(voolRegAuthorizeID, 19)
+	if err != nil {
+		return "", err
+	}
+
+	// ASCII, nullterminiert
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+
+	return string(b), nil
+}
+
 var _ api.Identifier = (*Vool)(nil)
 
 // Identify implements the api.Identifier interface
 func (wb *Vool) Identify() ([]string, error) {
-	b, err := wb.conn.ReadHoldingRegisters(voolRegAuthorizeID, 18)
+	state, err := wb.readUint16(voolRegChargerState)
 	if err != nil {
 		return nil, err
 	}
 
-	// ASCII, nullterminiert
-	id := strings.TrimRight(string(b), "\x00")
-	if id == "" {
+	// kein Fahrzeug: gemerkte Karte verwerfen, die Box löscht die ID nicht selbst
+	if state == 1 { // AVAILABLE
+		wb.id = ""
 		return nil, nil
 	}
 
-	return []string{id}, nil
+	event, err := wb.readUint16(voolRegEvent)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bit 0: neue Karte erkannt
+	if event&1 != 0 {
+		id, err := wb.readAuthorizeID()
+		if err != nil {
+			return nil, err
+		}
+		wb.id = id
+	}
+
+	if wb.id == "" {
+		return nil, nil
+	}
+
+	return []string{wb.id}, nil
 }
 
 var _ api.Diagnosis = (*Vool)(nil)
@@ -324,7 +375,7 @@ func (wb *Vool) Diagnose() {
 	if u, err := wb.readUint16(voolRegCurrentLimit); err == nil {
 		fmt.Printf("Current limit:\t%.2f A\n", float64(u)/100)
 	}
-	if id, err := wb.Identify(); err == nil {
-		fmt.Printf("Authorize Id:\t%v\n", id)
+	if id, err := wb.readAuthorizeID(); err == nil {
+		fmt.Printf("Authorize Id:\t%s\n", id)
 	}
 }

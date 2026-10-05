@@ -22,17 +22,16 @@ caveats:
       de: Die Phasenumschaltung ist auf 10 Schaltvorgänge pro Stunde begrenzt.
       en: Phase switching is limited to 10 switching operations per hour.
 params:
-  - name: modbus
-    choice: ["tcpip"]
-    id: 255
+  - name: host
   - name: phase
     type: choice
     choice: ["L1", "L2", "L3"]
     default: "L1"
+    required: true
     description:
       de: Netzphase für einphasiges Laden
       en: Grid phase used for single-phase charging
 render: |
   type: vool
-  {{- include "modbus" . }}
+  uri: {{ joinHostPort .host "502" }}
   phase: {{ .phase }}
